@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <time.h>
 #include <signal.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -65,8 +66,12 @@ static int split_hostport(char *arg, char **host, char **port)
   return 0;
 }
 
-/* Create a listening socket for the given host and port. */
-static int make_listen_socket(const char *host, const char *port)
+#define MAX_LISTEN 8
+
+/* Bind and listen on every address the name resolves to. A DNS name may map to
+   both IPv4 and IPv6, and the client may use either, so we serve them all.
+   Returns the number of listening sockets placed in fds[]. */
+static int make_listen_sockets(const char *host, const char *port, int *fds)
 {
   struct addrinfo hints, *res, *rp;
   memset(&hints, 0, sizeof(hints));
@@ -77,26 +82,32 @@ static int make_listen_socket(const char *host, const char *port)
   int rc = getaddrinfo(host, port, &hints, &res);
   if (rc != 0) {
     fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
-    return -1;
+    return 0;
   }
 
-  int fd = -1;
-  for (rp = res; rp != NULL; rp = rp->ai_next) {
-    fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+  int count = 0;
+  for (rp = res; rp != NULL && count < MAX_LISTEN; rp = rp->ai_next) {
+    int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (fd < 0)
       continue;
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0 && listen(fd, 16) == 0)
-      break;
-    close(fd);
-    fd = -1;
+    if (rp->ai_family == AF_INET6) {
+      /* keep IPv6 sockets independent so an IPv4 bind can also succeed */
+      int on = 1;
+      setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    }
+    if (bind(fd, rp->ai_addr, rp->ai_addrlen) != 0 || listen(fd, 16) != 0) {
+      close(fd);
+      continue;
+    }
+    fds[count++] = fd;
   }
   freeaddrinfo(res);
 
-  if (fd < 0)
+  if (count == 0)
     fprintf(stderr, "Failed to bind %s:%s\n", host, port);
-  return fd;
+  return count;
 }
 
 static int send_all(int fd, const void *buf, size_t len)
@@ -314,39 +325,59 @@ int main(int argc, char *argv[])
   signal(SIGCHLD, SIG_IGN);   /* auto-reap children, no zombies */
   signal(SIGPIPE, SIG_IGN);
 
-  int listenfd = make_listen_socket(host, port);
-  if (listenfd < 0)
+  int listenfds[MAX_LISTEN];
+  int nlisten = make_listen_sockets(host, port, listenfds);
+  if (nlisten == 0)
     exit(EXIT_FAILURE);
 
   printf("TCP server on: %s:%s\n", host, port);
   fflush(stdout);
 
-  for (;;) {
-    struct sockaddr_storage peer;
-    socklen_t plen = sizeof(peer);
-    int clientfd = accept(listenfd, (struct sockaddr *)&peer, &plen);
-    if (clientfd < 0) {
-      if (errno == EINTR)
-        continue;
-      perror("accept");
-      continue;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-      perror("fork");
-      close(clientfd);
-      continue;
-    }
-    if (pid == 0) {
-      close(listenfd);
-      serve(clientfd);
-      close(clientfd);
-      _exit(EXIT_SUCCESS);
-    }
-    close(clientfd);
+  struct pollfd pfds[MAX_LISTEN];
+  for (int i = 0; i < nlisten; i++) {
+    pfds[i].fd = listenfds[i];
+    pfds[i].events = POLLIN;
   }
 
-  close(listenfd);
+  for (;;) {
+    if (poll(pfds, nlisten, -1) < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("poll");
+      break;
+    }
+
+    for (int i = 0; i < nlisten; i++) {
+      if (!(pfds[i].revents & POLLIN))
+        continue;
+
+      struct sockaddr_storage peer;
+      socklen_t plen = sizeof(peer);
+      int clientfd = accept(listenfds[i], (struct sockaddr *)&peer, &plen);
+      if (clientfd < 0) {
+        if (errno != EINTR)
+          perror("accept");
+        continue;
+      }
+
+      pid_t pid = fork();
+      if (pid < 0) {
+        perror("fork");
+        close(clientfd);
+        continue;
+      }
+      if (pid == 0) {
+        for (int j = 0; j < nlisten; j++)
+          close(listenfds[j]);
+        serve(clientfd);
+        close(clientfd);
+        _exit(EXIT_SUCCESS);
+      }
+      close(clientfd);
+    }
+  }
+
+  for (int i = 0; i < nlisten; i++)
+    close(listenfds[i]);
   return 0;
 }

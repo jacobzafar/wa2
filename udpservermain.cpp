@@ -317,7 +317,11 @@ static void handle_first_message(int sock, const unsigned char *buf, ssize_t n,
   DBG("[udp] datagram rejected (size=%zd)\n", n);
 }
 
-static int make_udp_socket(const char *host, const char *port)
+#define MAX_SOCKETS 8
+
+/* Bind one datagram socket per resolved address so the server answers on both
+   IPv4 and IPv6 when a DNS name maps to both. */
+static int make_udp_sockets(const char *host, const char *port, int *fds)
 {
   struct addrinfo hints, *res, *rp;
   memset(&hints, 0, sizeof(hints));
@@ -328,26 +332,31 @@ static int make_udp_socket(const char *host, const char *port)
   int rc = getaddrinfo(host, port, &hints, &res);
   if (rc != 0) {
     fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
-    return -1;
+    return 0;
   }
 
-  int fd = -1;
-  for (rp = res; rp != NULL; rp = rp->ai_next) {
-    fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+  int count = 0;
+  for (rp = res; rp != NULL && count < MAX_SOCKETS; rp = rp->ai_next) {
+    int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (fd < 0)
       continue;
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    if (bind(fd, rp->ai_addr, rp->ai_addrlen) == 0)
-      break;
-    close(fd);
-    fd = -1;
+    if (rp->ai_family == AF_INET6) {
+      int on = 1;
+      setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    }
+    if (bind(fd, rp->ai_addr, rp->ai_addrlen) != 0) {
+      close(fd);
+      continue;
+    }
+    fds[count++] = fd;
   }
   freeaddrinfo(res);
 
-  if (fd < 0)
+  if (count == 0)
     fprintf(stderr, "Failed to bind %s:%s\n", host, port);
-  return fd;
+  return count;
 }
 
 int main(int argc, char *argv[])
@@ -369,19 +378,22 @@ int main(int argc, char *argv[])
 
   initCalcLib();
 
-  int sock = make_udp_socket(host, port);
-  if (sock < 0)
+  int socks[MAX_SOCKETS];
+  int nsocks = make_udp_sockets(host, port, socks);
+  if (nsocks == 0)
     exit(EXIT_FAILURE);
 
   printf("UDP server on: %s:%s\n", host, port);
   fflush(stdout);
 
-  for (;;) {
-    struct pollfd pfd;
-    pfd.fd = sock;
-    pfd.events = POLLIN;
+  struct pollfd pfds[MAX_SOCKETS];
+  for (int i = 0; i < nsocks; i++) {
+    pfds[i].fd = socks[i];
+    pfds[i].events = POLLIN;
+  }
 
-    int pr = poll(&pfd, 1, next_timeout_ms(time(NULL)));
+  for (;;) {
+    int pr = poll(pfds, nsocks, next_timeout_ms(time(NULL)));
     if (pr < 0) {
       if (errno == EINTR)
         continue;
@@ -389,11 +401,14 @@ int main(int argc, char *argv[])
       break;
     }
 
-    if (pr > 0 && (pfd.revents & POLLIN)) {
+    for (int i = 0; i < nsocks; i++) {
+      if (!(pfds[i].revents & POLLIN))
+        continue;
+
       unsigned char buf[512];
       struct sockaddr_storage src;
       socklen_t srclen = sizeof(src);
-      ssize_t n = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+      ssize_t n = recvfrom(socks[i], buf, sizeof(buf) - 1, 0,
                            (struct sockaddr *)&src, &srclen);
       if (n < 0) {
         if (errno != EINTR)
@@ -404,14 +419,15 @@ int main(int argc, char *argv[])
 
       struct client_entry *c = find_client(&src, srclen);
       if (c)
-        handle_second_message(sock, c, buf, n, &src, srclen);
+        handle_second_message(socks[i], c, buf, n, &src, srclen);
       else
-        handle_first_message(sock, buf, n, &src, srclen);
+        handle_first_message(socks[i], buf, n, &src, srclen);
     }
 
     sweep_clients(time(NULL));
   }
 
-  close(sock);
+  for (int i = 0; i < nsocks; i++)
+    close(socks[i]);
   return 0;
 }
