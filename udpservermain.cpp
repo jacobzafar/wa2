@@ -46,6 +46,8 @@ struct client_entry {
   int in_use;
   struct sockaddr_storage addr;
   socklen_t addrlen;
+  int is_binary;
+  uint32_t id;          /* binary only */
   int arith;
   int32_t v1, v2;
   int32_t expected;
@@ -184,6 +186,19 @@ static void send_text(int sock, const struct sockaddr_storage *addr,
   sendto(sock, s, strlen(s), 0, (const struct sockaddr *)addr, addrlen);
 }
 
+static void send_calcmessage(int sock, const struct sockaddr_storage *addr,
+                             socklen_t addrlen, uint32_t message)
+{
+  struct calcMessage m;
+  memset(&m, 0, sizeof(m));
+  m.type = htons(2);          /* server to client, binary */
+  m.message = htonl(message); /* 1 = OK, 2 = NOT OK */
+  m.protocol = htons(17);     /* UDP */
+  m.major_version = htons(1);
+  m.minor_version = htons(1);
+  sendto(sock, &m, sizeof(m), 0, (const struct sockaddr *)addr, addrlen);
+}
+
 static int looks_numeric(const char *s, ssize_t n)
 {
   ssize_t i = 0;
@@ -199,9 +214,9 @@ static int looks_numeric(const char *s, ssize_t n)
   return digits > 0;
 }
 
-/* Hand a fresh text task to a newly seen client. */
+/* Hand a fresh task to a newly seen client. */
 static void start_client(int sock, const struct sockaddr_storage *addr,
-                         socklen_t addrlen)
+                         socklen_t addrlen, int is_binary)
 {
   struct client_entry *c = alloc_client(addr, addrlen);
   if (!c) {
@@ -210,12 +225,29 @@ static void start_client(int sock, const struct sockaddr_storage *addr,
   }
   gen_task(&c->arith, &c->v1, &c->v2);
   c->expected = compute(c->arith, c->v1, c->v2);
+  c->is_binary = is_binary;
 
-  char task[128];
-  int len = snprintf(task, sizeof(task), "%s %d %d\n",
-                     arith_name(c->arith), c->v1, c->v2);
-  sendto(sock, task, (size_t)len, 0, (const struct sockaddr *)addr, addrlen);
-  DBG("[udp] text task: %s %d %d\n", arith_name(c->arith), c->v1, c->v2);
+  if (is_binary) {
+    c->id = (uint32_t)rand() ^ ((uint32_t)time(NULL) << 8);
+    struct calcProtocol p;
+    memset(&p, 0, sizeof(p));
+    p.type = htons(1);
+    p.major_version = htons(1);
+    p.minor_version = htons(1);
+    p.id = htonl(c->id);
+    p.arith = htonl((uint32_t)c->arith);
+    p.inValue1 = (int32_t)htonl((uint32_t)c->v1);
+    p.inValue2 = (int32_t)htonl((uint32_t)c->v2);
+    p.inResult = 0;
+    sendto(sock, &p, sizeof(p), 0, (const struct sockaddr *)addr, addrlen);
+    DBG("[udp] bin task id=%u arith=%d %d %d\n", c->id, c->arith, c->v1, c->v2);
+  } else {
+    char task[128];
+    int len = snprintf(task, sizeof(task), "%s %d %d\n",
+                       arith_name(c->arith), c->v1, c->v2);
+    sendto(sock, task, (size_t)len, 0, (const struct sockaddr *)addr, addrlen);
+    DBG("[udp] text task: %s %d %d\n", arith_name(c->arith), c->v1, c->v2);
+  }
 }
 
 static void handle_second_message(int sock, struct client_entry *c,
@@ -223,32 +255,65 @@ static void handle_second_message(int sock, struct client_entry *c,
                                   const struct sockaddr_storage *addr,
                                   socklen_t addrlen)
 {
-  if (!looks_numeric((const char *)buf, n))
-    return; /* not an answer, let it retry until timeout */
-  long answer = strtol((const char *)buf, NULL, 10);
-  const char *reply = (answer == (long)c->expected) ? "OK\n" : "ERROR\n";
-  DBG("[udp] text answer=%ld expected=%d -> %s", answer, c->expected, reply);
-  send_text(sock, addr, addrlen, reply);
-  free_client(c);
+  if (c->is_binary) {
+    if (n != (ssize_t)sizeof(struct calcProtocol))
+      return; /* malformed, let it retry until timeout */
+    struct calcProtocol in;
+    memcpy(&in, buf, sizeof(in));
+    uint32_t rid = ntohl(in.id);
+    int32_t rresult = (int32_t)ntohl((uint32_t)in.inResult);
+    uint32_t verdict = (rid == c->id && rresult == c->expected) ? 1 : 2;
+    DBG("[udp] bin answer=%d expected=%d -> %s\n", rresult, c->expected,
+        verdict == 1 ? "OK" : "NOT OK");
+    send_calcmessage(sock, addr, addrlen, verdict);
+    free_client(c);
+  } else {
+    if (!looks_numeric((const char *)buf, n))
+      return; /* not an answer, let it retry until timeout */
+    long answer = strtol((const char *)buf, NULL, 10);
+    const char *reply = (answer == (long)c->expected) ? "OK\n" : "ERROR\n";
+    DBG("[udp] text answer=%ld expected=%d -> %s", answer, c->expected, reply);
+    send_text(sock, addr, addrlen, reply);
+    free_client(c);
+  }
 }
 
 static void handle_first_message(int sock, const unsigned char *buf, ssize_t n,
                                  const struct sockaddr_storage *addr,
                                  socklen_t addrlen)
 {
-  /* A text message starts with a printable character. */
+  /* A binary message starts with a 16-bit type in network byte order, so its
+     first byte is always 0x00. A text message starts with a printable char. */
   int printable = (n > 0 && buf[0] >= 0x20 && buf[0] < 0x7f);
 
-  if (printable && n <= 32 &&
-      strncmp((const char *)buf, TEXT_HANDSHAKE, strlen(TEXT_HANDSHAKE)) == 0) {
-    start_client(sock, addr, addrlen);
+  if (!printable && n == (ssize_t)sizeof(struct calcMessage)) {
+    struct calcMessage m;
+    memcpy(&m, buf, sizeof(m));
+    uint16_t type = ntohs(m.type);
+    uint16_t major = ntohs(m.major_version);
+    uint16_t minor = ntohs(m.minor_version);
+    if (type < 21 || type > 23 || major != 1 || minor != 1) {
+      DBG("[udp] bad binary handshake type=%u v=%u.%u\n", type, major, minor);
+      send_calcmessage(sock, addr, addrlen, 2);
+      return;
+    }
+    start_client(sock, addr, addrlen, 1);
     return;
   }
 
-  /* Anything else: an unknown or stale datagram, for instance an answer that
-     arrives after its task was dropped. Reject a plausible answer explicitly. */
-  if (printable && looks_numeric((const char *)buf, n))
+  if (printable && n <= 32 &&
+      strncmp((const char *)buf, TEXT_HANDSHAKE, strlen(TEXT_HANDSHAKE)) == 0) {
+    start_client(sock, addr, addrlen, 0);
+    return;
+  }
+
+  /* Anything else: an unknown or stale datagram (for instance an answer that
+     arrives after its task was dropped). Reject it explicitly. */
+  if (!printable && n == (ssize_t)sizeof(struct calcProtocol)) {
+    send_calcmessage(sock, addr, addrlen, 2);
+  } else if (printable && looks_numeric((const char *)buf, n)) {
     send_text(sock, addr, addrlen, "ERROR\n");
+  }
   DBG("[udp] datagram rejected (size=%zd)\n", n);
 }
 
