@@ -112,6 +112,19 @@ static int send_all(int fd, const void *buf, size_t len)
   return 0;
 }
 
+static int recv_all(int fd, void *buf, size_t len)
+{
+  unsigned char *p = (unsigned char *)buf;
+  size_t got = 0;
+  while (got < len) {
+    ssize_t n = recv(fd, p + got, len - got, 0);
+    if (n <= 0)
+      return -1;
+    got += (size_t)n;
+  }
+  return 0;
+}
+
 /* Read one '\n' terminated line. Reads a byte at a time so we never consume
    bytes that belong to a following binary message. */
 static ssize_t recv_line(int fd, char *buf, size_t max)
@@ -207,6 +220,54 @@ static void serve_text(int fd)
   send_all(fd, reply, strlen(reply));
 }
 
+static void serve_binary(int fd)
+{
+  int arith;
+  int32_t v1, v2;
+  gen_task(&arith, &v1, &v2);
+  uint32_t id = (uint32_t)rand() ^ ((uint32_t)getpid() << 16);
+
+  struct calcProtocol out;
+  memset(&out, 0, sizeof(out));
+  out.type = htons(1);              /* server to client */
+  out.major_version = htons(1);
+  out.minor_version = htons(1);
+  out.id = htonl(id);
+  out.arith = htonl((uint32_t)arith);
+  out.inValue1 = (int32_t)htonl((uint32_t)v1);
+  out.inValue2 = (int32_t)htonl((uint32_t)v2);
+  out.inResult = 0;
+  DBG("[tcp] bin task id=%u arith=%d %d %d\n", id, arith, v1, v2);
+
+  alarm(OP_TIMEOUT);
+  if (send_all(fd, &out, sizeof(out)) < 0)
+    return;
+  alarm(0);
+
+  struct calcProtocol in;
+  alarm(OP_TIMEOUT);
+  int rc = recv_all(fd, &in, sizeof(in));
+  alarm(0);
+  if (rc < 0)
+    return;
+
+  uint32_t rid = ntohl(in.id);
+  int32_t rresult = (int32_t)ntohl((uint32_t)in.inResult);
+  int32_t correct = compute(arith, v1, v2);
+
+  struct calcMessage msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.type = htons(2);             /* server to client, binary */
+  msg.protocol = htons(6);         /* TCP */
+  msg.major_version = htons(1);
+  msg.minor_version = htons(1);
+  uint32_t verdict = (rid == id && rresult == correct) ? 1 : 2;
+  msg.message = htonl(verdict);
+  DBG("[tcp] bin result=%d correct=%d -> %s\n", rresult, correct,
+      verdict == 1 ? "OK" : "NOT OK");
+  send_all(fd, &msg, sizeof(msg));
+}
+
 static void serve(int fd)
 {
   g_client_fd = fd;
@@ -228,6 +289,8 @@ static void serve(int fd)
 
   if (strncmp(line, "TEXT TCP 1.1", 12) == 0) {
     serve_text(fd);
+  } else if (strncmp(line, "BINARY TCP 1.1", 14) == 0) {
+    serve_binary(fd);
   } else {
     const char *err = "ERROR\n";
     send_all(fd, err, strlen(err));
