@@ -39,3 +39,12 @@
 
 # debug information files
 *.dwo
+
+# build output
+/test
+/tcpserver
+/udpserver
+
+# local test helper, not part of the submission
+test_servers.py
+*.log
